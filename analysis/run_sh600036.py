@@ -193,6 +193,118 @@ def run_backtest(df):
     return trades
 
 
+def generate_monthly_table(df, trades):
+    # Build monthly close series
+    monthly = get_monthly_close(df)
+    month_ends = monthly['date'].tolist()
+    month_closes = monthly['close'].tolist()
+
+    # Create lookup arrays
+    month_periods = [pd.Period(d, freq='M') for d in month_ends]
+    idx_map = {p.to_timestamp('M'): i for i, p in enumerate(month_periods)}
+
+    # Initialize monthly rows
+    rows = []
+    # Pre-fill operations as 空
+    operations = ['空'] * len(month_ends)
+
+    # Build mapping from month index to trades that start/end in that month
+    for t in trades:
+        buy_month = pd.Period(t['buy_date'], freq='M').to_timestamp('M')
+        sell_month = pd.Period(t['sell_date'], freq='M').to_timestamp('M')
+        b_idx = idx_map.get(buy_month)
+        s_idx = idx_map.get(sell_month)
+        if b_idx is None or s_idx is None:
+            continue
+        operations[b_idx] = '买'
+        operations[s_idx] = '卖'
+        # mark intermediate months as 持
+        for k in range(b_idx+1, s_idx):
+            operations[k] = '持'
+
+    # Compute baseline min and rebound for each month, simulating min_start_idx changes
+    min_start_idx = None
+    for i in range(len(month_ends)):
+        current_close = month_closes[i]
+        # determine baseline start
+        if min_start_idx is None:
+            if i < MIN_MONTHS - 1:
+                baseline_min = None
+            else:
+                start_idx = i - (MIN_MONTHS - 1)
+                baseline_min = min(month_closes[start_idx: i + 1])
+        else:
+            start_idx = min_start_idx
+            baseline_min = min(month_closes[start_idx: i + 1])
+
+        # find if current month had a sell (update min_start_idx after computing baseline)
+        # if any trade has sell month == current month, set new min_start_idx to current month
+        sell_in_month = False
+        for t in trades:
+            s_month = pd.Period(t['sell_date'], freq='M').to_timestamp('M')
+            if s_month == month_ends[i].to_period('M').to_timestamp('M'):
+                sell_in_month = True
+                break
+
+        # compute peak close (if in holding at end of this month): for simplifying, compute max close since buy to this month end
+        peak_close = None
+        # We can detect if currently holding month-end by operation '持' or '买' but before sell; we'll search any trade whose buy<=this month and sell>this month
+        holding_trade = None
+        for t in trades:
+            b_month = pd.Period(t['buy_date'], freq='M').to_timestamp('M')
+            s_month = pd.Period(t['sell_date'], freq='M').to_timestamp('M')
+            if b_month <= month_ends[i].to_period('M').to_timestamp('M') <= s_month:
+                holding_trade = t
+                break
+        if holding_trade is not None:
+            # compute peak close from buy_pos to end of current month
+            buy_pos = holding_trade['buy_pos']
+            # find last daily index in this month
+            last_day_mask = df['date'].dt.to_period('M') == month_ends[i].to_period('M')
+            if last_day_mask.any():
+                last_idx = last_day_mask[last_day_mask].index[-1]
+                peak_close = df.iloc[buy_pos:last_idx + 1]['close'].max()
+            else:
+                peak_close = df.iloc[buy_pos:]['close'].max()
+
+        # compute drop percentage relative to peak_close if available
+        drop_pct = None
+        if peak_close is not None and peak_close > 0:
+            drop_pct = (month_closes[i] / peak_close - 1) * 100
+
+        # unrealized return for holding or buy months
+        unreal_ret = None
+        if holding_trade is not None:
+            buy_price = holding_trade['buy_price']
+            unreal_ret = (month_closes[i] / buy_price - 1) * 100
+
+        # realized return if sells happen in this month — find the trade
+        realized_ret = None
+        for t in trades:
+            s_month = pd.Period(t['sell_date'], freq='M').to_timestamp('M')
+            if s_month == month_ends[i].to_period('M').to_timestamp('M'):
+                realized_ret = t['return_pct']
+                break
+
+        op = operations[i]
+        rows.append({
+            '日期': month_ends[i].strftime('%Y-%m-%d'),
+            '操作': op,
+            '收盘价': float(f"{month_closes[i]:.2f}"),
+            '最低价': float(f"{baseline_min:.2f}") if baseline_min is not None else '',
+            '反弹比率': float(f"{((month_closes[i] / baseline_min - 1) * 100 if baseline_min else 0):.2f}") if baseline_min else '',
+            '最高收盘价': float(f"{peak_close:.2f}") if peak_close is not None else '',
+            '回落%': float(f"{drop_pct:.2f}") if drop_pct is not None else '',
+            '收益%': float(f"{(realized_ret if realized_ret is not None else (unreal_ret if unreal_ret is not None else 0)):.2f}") if (realized_ret is not None or unreal_ret is not None) else '',
+        })
+
+        if sell_in_month:
+            min_start_idx = i
+
+    out_monthly_df = pd.DataFrame(rows)
+    return out_monthly_df
+
+
 if __name__ == '__main__':
     df = load_df(CSV_PATH)
     if df.empty:
@@ -230,6 +342,10 @@ if __name__ == '__main__':
         out_df['return_pct'] = out_df['return_pct'].map(lambda x: f"{x:.2f}")
 
         out_df.to_csv(OUT_FILE, index=False)
+        # 生成并写入月度汇总表
+        monthly_df = generate_monthly_table(df, trades)
+        monthly_out_file = os.path.join(OUT_DIR, 'sh600036_monthly.csv')
+        monthly_df.to_csv(monthly_out_file, index=False)
 
         # 打印输出
         print('交易明细:')
