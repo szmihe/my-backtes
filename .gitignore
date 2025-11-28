@@ -1,0 +1,5 @@
+# 忽略原始数据和自动修复后的数据文件
+*.csv
+!manifest.csv
+!*.fixed.csv
+!validation_report_autofix_all.json
