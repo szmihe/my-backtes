@@ -12,13 +12,27 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
+"""
+回测脚本: 招商银行 (sh600036)
+回测日期：2020-01-01 - 2025-09-30
+买入条件：当月收盘较最近16月最低价反弹超过9%，在下一个交易日以开盘价买入
+卖出条件：当日收盘 < 买入后最高收盘价 * 94% 或 当日收盘 < 买入价 * 94% （满足任一条件即卖出，卖出价为当日收盘价）
+卖出后重新以卖出月为起始重新计算最低价，直到再次满足月末反弹9%则买入
+
+输出：CSV 导出包含每笔交易明细及收益，汇总总收益（按复利计算）以及交易次数和胜率
+"""
+
+import os
+import pandas as pd
+import numpy as np
+
 # 配置
 CSV_PATH = '/Users/mic/Downloads/20250930/sh600036.csv'
 OUT_DIR = 'outputs'
 OUT_FILE = os.path.join(OUT_DIR, 'sh600036_trades.csv')
 START_DATE = '2020-01-01'
 END_DATE = '2025-09-30'
-MIN_MONTHS = 16  # 计算16月最低价
+MIN_MONTHS = 16  # 初始计算所需的历史月数
 REBATE_PCT = 0.09  # 9% 反弹
 TRAIL_PCT = 0.94  # 94% 止损阈值
 
@@ -33,7 +47,6 @@ def load_df(csv_path):
 
 
 def get_monthly_close(df):
-    # 月度收盘为每月最后一个交易日的close
     df['month'] = df['date'].dt.to_period('M')
     m = df.groupby('month').agg({'date': 'max', 'close': 'last'})
     m.index = m.index.to_timestamp('M')
@@ -42,125 +55,140 @@ def get_monthly_close(df):
 
 
 def run_backtest(df):
+    """实现按月末判断买入，并在持仓期间按日扫描卖出的逻辑。
+    卖出后，以卖出月为起始重新计算最低价，直到再次满足月末反弹9%则买入。
+    返回 trades 列表，每项为 dict 包含买、卖信息与收益。"""
+
     trades = []
     monthly = get_monthly_close(df)
-    months = monthly.index
+    month_ends = monthly['date'].tolist()
+    month_closes = monthly['close'].tolist()
+
+    # Helper: find first trading day (pos) after given date
+    def next_trade_pos_after(date):
+        # find first index where daily date > date
+        mask = df['date'] > date
+        if mask.any():
+            label_idx = mask[mask].index[0]
+            return df.index.get_loc(label_idx)
+        return None
+
+    # Prepare month periods for mapping
+    month_periods = [pd.Period(d, freq='M') for d in month_ends]
 
     position = False
-    buy_price = None
-    buy_date = None
-    peak_close = None
+    min_start_idx = None  # None means initial phase where we need 16 months history
 
-    # Map the monthly event date to the next trading day in daily df
-    month_to_next_trading_day = {}
-    for _, row in monthly.iterrows():
-        month_end_date = row['date']
-        # find first trading day after month_end_date
-        mask = df['date'] > month_end_date
-        if mask.any():
-            next_trade_date = df.loc[mask.idxmax(), 'date']
-            # But be careful with idxmax weirdness: find the first index where date > month_end_date
-            first_idx = mask[mask].index[0]
-            next_trade_date = df.loc[first_idx, 'date']
-            month_to_next_trading_day[month_end_date] = next_trade_date
+    i = 0
+    while i < len(month_ends):
+        current_close = month_closes[i]
+        # pick start index for min calculation
+        if min_start_idx is None:
+            if i < MIN_MONTHS - 1:
+                i += 1
+                continue
+            start_idx = i - (MIN_MONTHS - 1)
+        else:
+            start_idx = min_start_idx
 
-    # For each month, compute prior MIN_MONTHS minima of monthly close
-    for i in range(len(months)):
-        current_month = months[i]
-        current_close = monthly.loc[current_month, 'close']
-        # check we have at least MIN_MONTHS history including current
-        start_idx = max(0, i - (MIN_MONTHS - 1))
-        # only evaluate if we have exactly MIN_MONTHS previous months (inclusive), otherwise skip
-        if i - start_idx + 1 < MIN_MONTHS:
-            continue
-        lookback = monthly.iloc[start_idx:i+1]['close']
-        min_16 = lookback.min()
-        if current_close > min_16 * (1 + REBATE_PCT):
-            # buy signal on next trading day after month end
-            month_end_date = monthly.loc[current_month, 'date']
-            if month_end_date not in month_to_next_trading_day:
-                continue
-            buy_dt = month_to_next_trading_day[month_end_date]
-            # ensure buy date exists in df and within our date range
-            row_buy_idx = df.index[df['date'] == buy_dt].tolist()
-            if not row_buy_idx:
-                continue
-            buy_idx_label = row_buy_idx[0]
-            buy_pos = df.index.get_loc(buy_idx_label)
-            if not position:
+        min_close = min(month_closes[start_idx: i + 1])
+
+        # if not in position and buy condition satisfied, buy on next trading day
+        if (not position) and (current_close > min_close * (1 + REBATE_PCT)):
+            next_pos = next_trade_pos_after(month_ends[i])
+            if next_pos is not None:
+                buy_pos = next_pos
                 buy_date = df.iloc[buy_pos]['date']
-                buy_price = float(df.iloc[buy_pos]['open'])  # 全仓按开盘价买入
-                position = True
+                buy_price = float(df.iloc[buy_pos]['open'])
                 peak_close = float(df.iloc[buy_pos]['close'])
-                # record entry
+
                 trades.append({
                     'buy_date': buy_date,
+                    'signal_month_end': month_ends[i],
                     'buy_price': round(buy_price, 2),
                     'buy_pos': buy_pos,
                     'sell_date': None,
                     'sell_price': None,
                     'peak_close': round(peak_close, 2),
                     'return_pct': None,
-                    'duration_days': None
+                    'duration_days': None,
                 })
-            # else: if already in position, ignore this buy
-
-        # After buy, we should check every trading day for sell conditions until we close
-        if position:
-            # start scanning from the buy_idx+1 (or buy_idx if same day) until we encounter sell
-            # but we must scan the days after the last recorded buy; we can simply iterate daily from buy_date index
-            # maintain pointer to the buy trade
-            pass
-
-    # A simpler approach: after we collect buy dates, walk forward to find sells
-    # Extract all buy events from trades (with None sell_date)
-    # now iterate trades list and find sell dates one by one, scanning df forward
-    i = 0
-    while i < len(trades):
-        t = trades[i]
-        if t['sell_date'] is not None:
-            i += 1
-            continue
-        buy_dt = t['buy_date']
-        buy_price = t['buy_price']
-        buy_pos = t.get('buy_pos')
-        if buy_pos is None:
-            buy_idx_label = df.index[df['date'] == buy_dt].tolist()[0]
-            buy_pos = df.index.get_loc(buy_idx_label)
-        peak_close = float(df.iloc[buy_pos]['close'])
-        sell_idx = None
-        for j in range(buy_pos + 1, len(df)):
-            c = float(df.iloc[j]['close'])
-            if c > peak_close:
-                peak_close = c
-            # 条件1: close < peak_close * 0.94
-            if c < peak_close * TRAIL_PCT:
-                sell_idx = j
-                break
-            # 条件2: close < buy_price * 0.94
-            if c < buy_price * TRAIL_PCT:
-                sell_idx = j
-                break
-        if sell_idx is not None:
-            sell_date = df.iloc[sell_idx]['date']
-            sell_price = float(df.iloc[sell_idx]['close'])
-            trades[i]['sell_date'] = sell_date
-            trades[i]['sell_price'] = round(sell_price, 2)
-            trades[i]['peak_close'] = round(peak_close, 2)
-            trades[i]['return_pct'] = round((sell_price / buy_price - 1) * 100, 2)
-            trades[i]['duration_days'] = int((sell_date - buy_dt).days)
-        else:
-            # 未找到卖出，在回测结束日对仓位进行清算（卖出价为最后交易日收盘）
-            last_dt = df.iloc[-1]['date']
-            last_close = float(df.iloc[-1]['close'])
-            sell_date = last_dt
-            sell_price = last_close
-            trades[i]['sell_date'] = sell_date
-            trades[i]['sell_price'] = round(sell_price, 2)
-            trades[i]['peak_close'] = round(peak_close, 2)
-            trades[i]['return_pct'] = round((sell_price / buy_price - 1) * 100, 2)
-            trades[i]['duration_days'] = int((sell_date - buy_dt).days)
+                position = True
+                # after buying, scan forward daily to find a sell
+                t = trades[-1]
+                sell_pos = None
+                for j in range(buy_pos + 1, len(df)):
+                    c = float(df.iloc[j]['close'])
+                    if c > peak_close:
+                        peak_close = c
+                    # condition: close < peak_close * 0.94 or close < buy_price * 0.94
+                    if (c < peak_close * TRAIL_PCT) or (c < buy_price * TRAIL_PCT):
+                        sell_pos = j
+                        break
+                if sell_pos is not None:
+                    sell_date = df.iloc[sell_pos]['date']
+                    sell_price = float(df.iloc[sell_pos]['close'])
+                    t['sell_date'] = sell_date
+                    t['sell_price'] = round(sell_price, 2)
+                    t['peak_close'] = round(peak_close, 2)
+                    t['return_pct'] = round((sell_price / buy_price - 1) * 100, 2)
+                    t['duration_days'] = int((sell_date - buy_date).days)
+                    position = False
+                    # set new min start index as sell month
+                    sell_month = pd.Period(sell_date, freq='M').to_timestamp('M')
+                    # find index of sell_month in month_ends list
+                    found_idx = None
+                    for k, d in enumerate(month_ends):
+                        if pd.Period(d, freq='M').to_timestamp('M') == sell_month:
+                            found_idx = k
+                            break
+                    if found_idx is None:
+                        found_idx = len(month_ends) - 1
+                    min_start_idx = found_idx
+                    # move pointer to the sell month to continue from there
+                    i = found_idx
+                    continue
+                else:
+                    # no sell until end; close at last day
+                    sell_pos = len(df) - 1
+                    sell_date = df.iloc[sell_pos]['date']
+                    sell_price = float(df.iloc[sell_pos]['close'])
+                    t['sell_date'] = sell_date
+                    t['sell_price'] = round(sell_price, 2)
+                    t['peak_close'] = round(peak_close, 2)
+                    t['return_pct'] = round((sell_price / buy_price - 1) * 100, 2)
+                    t['duration_days'] = int((sell_date - buy_date).days)
+                    position = False
+                    sell_month = pd.Period(sell_date, freq='M').to_timestamp('M')
+                    found_idx = None
+                    for k, d in enumerate(month_ends):
+                        if pd.Period(d, freq='M').to_timestamp('M') == sell_month:
+                            found_idx = k
+                            break
+                    if found_idx is None:
+                        found_idx = len(month_ends) - 1
+                    min_start_idx = found_idx
+                    i = found_idx
+                    continue
         i += 1
+
+    # Ensure all trades closed (safety), otherwise close at last day
+    for t in trades:
+        if t['sell_date'] is None:
+            sell_pos = len(df) - 1
+            sell_date = df.iloc[sell_pos]['date']
+            sell_price = float(df.iloc[sell_pos]['close'])
+            buy_price = t['buy_price']
+            peak_close = float(df.iloc[t['buy_pos']]['close'])
+            for j in range(t['buy_pos'] + 1, len(df)):
+                c = float(df.iloc[j]['close'])
+                if c > peak_close:
+                    peak_close = c
+            t['sell_date'] = sell_date
+            t['sell_price'] = round(sell_price, 2)
+            t['peak_close'] = round(peak_close, 2)
+            t['return_pct'] = round((sell_price / buy_price - 1) * 100, 2)
+            t['duration_days'] = int((sell_date - t['buy_date']).days)
 
     return trades
 
@@ -170,30 +198,43 @@ if __name__ == '__main__':
     if df.empty:
         raise SystemExit('在指定日期区间内未找到数据，请确认CSV和日期范围')
     trades = run_backtest(df)
+
     if not trades:
         print('在回测日期范围内未触发任何买入信号。')
     else:
-        # 写入输出CSV
         out_df = pd.DataFrame(trades)
-        # 移除内部使用的 buy_pos 字段
+        # Remove internal buy_pos
         if 'buy_pos' in out_df.columns:
             out_df = out_df.drop(columns=['buy_pos'])
-        # 计算总收益复利
+
+        # 计算总收益（复利）
         total_prod = 1.0
         for r in out_df['return_pct']:
-            total_prod *= (1 + (r/100.0))
+            total_prod *= (1 + (r / 100.0))
         total_ret_pct = round((total_prod - 1) * 100, 2)
-        out_df['buy_date'] = out_df['buy_date'].dt.strftime('%Y-%m-%d')
-        out_df['sell_date'] = out_df['sell_date'].dt.strftime('%Y-%m-%d')
+
+        out_df['buy_date'] = pd.to_datetime(out_df['buy_date']).dt.strftime('%Y-%m-%d')
+        out_df['sell_date'] = pd.to_datetime(out_df['sell_date']).dt.strftime('%Y-%m-%d')
+        if 'signal_month_end' in out_df.columns:
+            out_df['signal_month_end'] = pd.to_datetime(out_df['signal_month_end']).dt.strftime('%Y-%m-%d')
+
         out_df['buy_price'] = out_df['buy_price'].map(lambda x: float(f"{x:.2f}"))
         out_df['sell_price'] = out_df['sell_price'].map(lambda x: float(f"{x:.2f}"))
         out_df['peak_close'] = out_df['peak_close'].map(lambda x: float(f"{x:.2f}"))
-        out_df['return_pct'] = out_df['return_pct'].map(lambda x: f"{x:.2f}")
+        out_df['return_pct'] = out_df['return_pct'].map(lambda x: float(f"{x:.2f}"))
+
+        # 交易次数、胜率
+        trades_count = len(out_df)
+        win_count = (out_df['return_pct'] > 0).sum()
+        win_rate = round(win_count / trades_count * 100, 2) if trades_count > 0 else 0.0
+
         out_df.to_csv(OUT_FILE, index=False)
-        # 打印表格预览
+
+        # 打印输出
         print('交易明细:')
         print(out_df.to_string(index=False))
         print('\n汇总:')
-        print(f'总交易次数: {len(out_df)}')
+        print(f'总交易次数: {trades_count}')
+        print(f'胜率: {win_rate}%')
         print(f'合计收益(复利): {total_ret_pct}%')
         print(f'输出文件: {OUT_FILE}')
