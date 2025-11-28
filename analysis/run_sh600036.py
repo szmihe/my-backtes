@@ -213,20 +213,21 @@ if __name__ == '__main__':
             total_prod *= (1 + (r / 100.0))
         total_ret_pct = round((total_prod - 1) * 100, 2)
 
+        # 交易次数、胜率（在格式化前计算）
+        trades_count = len(out_df)
+        win_count = (out_df['return_pct'] > 0).sum()
+        win_rate = round(win_count / trades_count * 100, 2) if trades_count > 0 else 0.0
+
+        # 格式化输出列
         out_df['buy_date'] = pd.to_datetime(out_df['buy_date']).dt.strftime('%Y-%m-%d')
         out_df['sell_date'] = pd.to_datetime(out_df['sell_date']).dt.strftime('%Y-%m-%d')
         if 'signal_month_end' in out_df.columns:
             out_df['signal_month_end'] = pd.to_datetime(out_df['signal_month_end']).dt.strftime('%Y-%m-%d')
 
-        out_df['buy_price'] = out_df['buy_price'].map(lambda x: float(f"{x:.2f}"))
-        out_df['sell_price'] = out_df['sell_price'].map(lambda x: float(f"{x:.2f}"))
-        out_df['peak_close'] = out_df['peak_close'].map(lambda x: float(f"{x:.2f}"))
-        out_df['return_pct'] = out_df['return_pct'].map(lambda x: float(f"{x:.2f}"))
-
-        # 交易次数、胜率
-        trades_count = len(out_df)
-        win_count = (out_df['return_pct'] > 0).sum()
-        win_rate = round(win_count / trades_count * 100, 2) if trades_count > 0 else 0.0
+        out_df['buy_price'] = out_df['buy_price'].map(lambda x: f"{x:.2f}")
+        out_df['sell_price'] = out_df['sell_price'].map(lambda x: f"{x:.2f}")
+        out_df['peak_close'] = out_df['peak_close'].map(lambda x: f"{x:.2f}")
+        out_df['return_pct'] = out_df['return_pct'].map(lambda x: f"{x:.2f}")
 
         out_df.to_csv(OUT_FILE, index=False)
 
