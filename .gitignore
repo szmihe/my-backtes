@@ -3,3 +3,4 @@
 !manifest.csv
 !*.fixed.csv
 !validation_report_autofix_all.json
+!outputs/*.csv
